@@ -1,3 +1,10 @@
+# No cred files
+.carbonblack/*
+temp/*
+
+# No exports
+*.csv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
