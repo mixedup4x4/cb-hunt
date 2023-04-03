@@ -1,6 +1,9 @@
 # No cred files
-.carbonblack/*
+.carbonblack/* 
+# testing
 temp/*
+debug.log
+test*.txt
 
 # No exports
 *.csv
