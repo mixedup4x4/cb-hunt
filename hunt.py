@@ -9,14 +9,13 @@ if sys.version_info.major == 3 and sys.version_info.minor < 9:
     exit(1)
 from cbc_sdk.rest_api import CBCloudAPI
 from cbc_sdk.platform import Device, Process
-from cbc_sdk.endpoint_standard import EnrichedEvent
+from cbc_sdk.endpoint_standard import EnrichedEvent,EnrichedEventFacet
 from cbc_sdk.utils import convert_from_cb, convert_to_cb
-import logging as l
+import logging
 import argparse
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 import tqdm
-#from tqdm.contrib.logging import logging_redirect_tqdm
 
 TABLE_TEMPLATE = {
         'NETWORK': [ # Ready for use. Complete. Format described here. This is generally the same for the rest of the templates.
@@ -132,6 +131,8 @@ TABLE_TEMPLATE = {
             'enriched_event_type','event_type','event_id','attack_tactic','attack_technique','ttp','event_description'  
         ]
     }
+# DEFINE GLOBAL LOGGER
+l = logging.getLogger()
 
 class bcolors:
     HEADER = '\033[95m'
@@ -143,6 +144,34 @@ class bcolors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+
+class CustomFormatter(logging.Formatter):
+    grey = "\x1b[38;20m"
+    yellow = "\x1b[33;20m"
+    red = "\x1b[31;20m"
+    bold_red = "\x1b[31;1m"
+    reset = "\x1b[0m"
+    format = "%(asctime)s [%(levelname)s]   \t%(message)s"
+
+    FORMATS = {
+        logging.DEBUG: grey + format + reset,
+        logging.INFO: grey + format + reset,
+        logging.WARNING: yellow + format + reset,
+        logging.ERROR: red + format + reset,
+        logging.CRITICAL: bold_red + format + reset,
+        'ignore_color': format
+    }
+
+    def __init__(self, ignore_color=False):
+        self.ignore_color = ignore_color
+
+    def format(self, record):
+        if self.ignore_color:
+            log_fmt = self.FORMATS.get('ignore_color')
+        else:
+            log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
 
 class build_query:
     '''Takes filters and turns them into an appropriate CBC query'''
@@ -157,16 +186,25 @@ class build_query:
         'enriched_event_type': 'enriched_event_type',
         'event_type': 'event_type',
         'username': 'process_username',
+        'start': 'start',
+        'end': 'end',
+        'window': 'window',
         '*': '*'
     }
 
-    def __init__(self, api, query_type, rows, kwargs={}): #this is where we define the instance
+    def __init__(self, api, query_type, rows, start, end, window=None, kwargs={}): #this is where we define the instance
         self.type=query_type
         if kwargs == {}:
             kwargs = {'*':'*'}
         self.args=kwargs
         self.rows=rows
         self.api=api
+        self.start=start
+        self.end=end
+        if window:
+            self.window=f'-{window}'
+        else:
+            self.window=window
 
     def make_query(self):
         if self.type == 'enriched_event':
@@ -174,16 +212,37 @@ class build_query:
             for key,value in self.args.items():
                 # make uppercase
                 if key in ('enriched_event_type'):
-                    value = value.upper()
+                    if type(value) == list:
+                        None
+                    else:
+                        value = value.upper()
                 # make lowercase
                 else:
-                    value = value.lower()
+                    if type(value) == list:
+                        None
+                    else:
+                        value = value.lower()
                 keyname = self.PARAMETER_MAPPING[key] # map to the actual filter name
-                filter = f'{keyname}:{value}'
+                
+                if type(value) == list:
+                    temp = []
+                    for v in value:
+                        temp.append(f'{keyname}:"{v}"')
+                        filter = '(' + ' OR '.join(temp) + ')'
+                else:
+                    filter = f'{keyname}:{value}'
                 # make uppercase
                 query.and_(filter)
-                l.debug(f'Applied the filter: "{filter}"')
+                l.critical(f'Applied the filter: {filter}')
+            
+            if self.window:
+                query.set_time_range(window=self.window)
+                l.critical(f'Time Range set for: {self.window}')
 
+            else:
+                query.set_time_range(start=self.start,end=self.end)
+                l.critical(f'Time Range set: {self.start} -> {self.end}')
+                
         elif type == 'process': # wip
             None
         elif type == 'alert': # wip 
@@ -201,25 +260,24 @@ def api_connect(p):
 
     return api
 
-def download_devices(api):        
+def download_devices(api, output_file):        
         try:
             devices = api.select(Device).set_os(["WINDOWS"]).set_status(["ALL"]).download()
 
-            l.info('Writing devices.csv')
-            with open('devices.csv', 'w') as csvfile:
+            l.info(f'Writing {output_file}')
+            with open(output_file, 'w') as csvfile:
                 for device in devices:
-                    w = csvfile.write(device)
-            l.info('Finished writing devices.csv')
+                    csvfile.write(device)
+            l.info(f'Finished writing {output_file}')
 
         except Exception as e:
             l.error(f'Failed to download devices: {e}')
 
-def get_enriched_events(query, export_template, output_file): #WIP
+def get_enriched_events(query, export_template, output_file,verbose):
     """
     Function that will retrieve all NETWORK events for a specified process
     export events to a csv
     """
-    #query = api.select(EnrichedEvent).where(enriched_event_type="NETWORK").set_rows(10000)
     try:
         # get the detailed output in an asynchronous fashion 
         results = [result.get_details(async_mode=True) for result in query]
@@ -238,18 +296,14 @@ def get_enriched_events(query, export_template, output_file): #WIP
             writer.writeheader()
             try:
                 l.info(f'Starting to iterate available results')
-                for result in tqdm.tqdm(results, unit='results', desc='getting detailed results'):
+                for result in tqdm.tqdm(results, unit='result', desc='getting detailed results', disable=verbose):
                     r = result.result()
                     row = {}
                     for field in fields:
                         try:
                             value = getattr(r, field)
-                            # normalizing dates
-                            # not required as of v0.3
-                            '''if field == "ingress_time":
-                                value = int(str(value)[:-3])
-                                value = datetime.fromtimestamp(value).isoformat(sep=" ",timespec='seconds')'''
                             
+                            # normalizing dates                          
                             if (field == "backend_timestamp") or (field == "process_start_time") or (field == "device_timestamp"):
                                 value = convert_from_cb(value).replace(tzinfo=None).isoformat(sep=" ",timespec='seconds')
 
@@ -292,6 +346,12 @@ def get_enriched_events(query, export_template, output_file): #WIP
 
         l.info(f'Finished writing {output_file}')
 
+def get_processes(query, export_template, output_file, ioc_file): # WIP
+    '''
+    This function will search for processes by name, signature state or hash. 
+    I intend to make this compatable with an input IOC file to do bulk searches for pre built queries
+    '''
+
 def argument_parser(author, version, date):
     parser = argparse.ArgumentParser(
         prog='python3.exe hunt.py',
@@ -304,28 +364,34 @@ def argument_parser(author, version, date):
 **  This may seem extremly slow compared to exporting searches from the console GUI. This is because this tool provides extended information that is not available \n\
     in the exports from the GUI. In my opinion, these details are very desirable in a Threat Hunting scenario, but maybe not in a Incident Response scenario. If \n\
     you are in a rush and don\'t need specific details, then I would reccomend using the GUI untill I implement simplified functionaility to this script. \n',
-        epilog=f'Author: {author}\tVersion: {version}\tDate: {date}\n\
-            Example usage:\n\
-                python3.exe hunt.py -d -o devices.csv\n\
-                python3.exe hunt.py -o [output.csv] query_enriched_events --device_name [hostname] --enriched_event_type [type] --ipaddr [IP]\n'
+        epilog=f'Author: {author}\tVersion: {version}\tDate: {date}\n\n\
+        Example usage:\n\
+            python3.exe hunt.py -d -o devices.csv\n\
+            python3.exe hunt.py -o [output.csv] investigate --device_name [hostname] --enriched_event_type [type] --ipaddr [IP]\n'
     )
+    start_time = (datetime.utcnow() - timedelta(days=7)).isoformat(timespec='seconds') + 'Z'
+    end_time = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+
     parser.add_argument('-v', '--verbose', required=False, action='store_true', help='Turn on verbose logging. Enables debug messages. This can be very noisy')
-    parser.add_argument('-d', '--devices', required=False, action='store_true', help='Export all of the devices to a csv file.')
-    parser.add_argument('-o', '--output', required=False, default='output.csv', action='store', help='File name or path to store the results in.')
+    parser.add_argument('-d', '--devices', required=False, action='store_true', help='Export all of the devices to a csv file')
+    parser.add_argument('-o', '--output', required=False, default='output.csv', action='store', help='File name or path to store the results in')
 
     sub_parsers = parser.add_subparsers(title='subcommands', description='The following subcommands are supported:', help='Use these sub commands to start dialing in your query', dest='command')
 
     #Enriched events query
-    enriched_events_query = sub_parsers.add_parser('query_enriched_events', help='Start building an enriched event query with supported filters. Wildcards are supported.')
-    enriched_events_query.add_argument('--device_name', required=False, action='store', help='Filter by device name')
-    enriched_events_query.add_argument('--cmdline', required=False, action='store', help='Filter by command line')
-    enriched_events_query.add_argument('--process_name', required=False, action='store', help='Filter by process name')
-    enriched_events_query.add_argument('--ipaddr', required=False, action='store', help='Filter by IP address')
-    enriched_events_query.add_argument('--domain_name', required=False, action='store', help='Filter by domain name')
+    enriched_events_query = sub_parsers.add_parser('investigate', help='Start building an enriched event query with supported filters. Wildcards are supported.')
+    enriched_events_query.add_argument('--device_name', required=False, nargs='+', action='store', help='Filter by device name')
+    enriched_events_query.add_argument('--cmdline', required=False, nargs='+', action='store', help='Filter by command line')
+    enriched_events_query.add_argument('--process_name', required=False, nargs='+', action='store', help='Filter by process name')
+    enriched_events_query.add_argument('--ipaddr', required=False, nargs='+', action='store', help='Filter by IP address')
+    enriched_events_query.add_argument('--domain_name', required=False, nargs='+', action='store', help='Filter by domain name')
     enriched_events_query.add_argument('--enriched_event_type', required=False, default=None, action='store', help='Filter by enriched event type')
     enriched_events_query.add_argument('--event_type', required=False, action='store', help='Filter by event type')
-    enriched_events_query.add_argument('--username', required=False, action='store', help='Filter by username')
+    enriched_events_query.add_argument('--username', required=False, nargs='+', action='store', help='Filter by username')
     enriched_events_query.add_argument('--rows', required=False, type=int, default=10000, action='store', help='Number of rows to get. Default is the maximum - 10000')
+    enriched_events_query.add_argument('--start', required=False, default=start_time, action='store', help='Timestamp (UTC) to start searching at in ISO 8601 format')
+    enriched_events_query.add_argument('--end', required=False, default=end_time, action='store', help='Timestamp (UTC) to end searching in ISO 8601 format')
+    enriched_events_query.add_argument('--window', required=False, default=None, action='store', help='Relative time in the format of -1[y,d,h,m,s]. Default is -7d (days)')
 
     # still needs work on the function for this
     '''process_query = sub_parsers.add_parser('query_processes', help='Start building a process query with supported filters')
@@ -353,32 +419,54 @@ def argument_parser(author, version, date):
 
     # Log configuration
     if(args.verbose):
-        l.basicConfig(
+        l.setLevel(logging.DEBUG)
+        #log handlers
+        screen = logging.StreamHandler()
+        screen.setLevel(logging.DEBUG)
+        screen.setFormatter(CustomFormatter())
+        debug_log = logging.FileHandler('debug.log')
+        debug_log.setLevel(logging.DEBUG)
+        debug_log.setFormatter(CustomFormatter(ignore_color=True))
+        l.addHandler(screen)
+        l.addHandler(debug_log)
+
+        '''l.basicConfig(
             level=l.DEBUG,
             format="%(asctime)s [%(levelname)s]   \t%(message)s",
             handlers=[
                 l.FileHandler("debug.log"),
                 l.StreamHandler()
             ]
-        )
+        )'''
     else:
-        l.basicConfig(
+        l.setLevel(logging.INFO)
+        #log handlers
+        screen = logging.StreamHandler()
+        screen.setLevel(logging.INFO)
+        screen.setFormatter(CustomFormatter())
+        debug_log = logging.FileHandler('debug.log')
+        debug_log.setLevel(logging.INFO)
+        debug_log.setFormatter(CustomFormatter(ignore_color=True))
+        l.addHandler(screen)
+        l.addHandler(debug_log)
+
+        '''l.basicConfig(
             level=l.INFO,
             format="%(asctime)s [%(levelname)s]   \t%(message)s",
             handlers=[
                 l.FileHandler("debug.log"),
                 l.StreamHandler()
             ]
-        )
+        )'''
 
     temp = vars(args)
     query_filter_dict = {}
     for key in temp:
-        if (key not in ('verbose', 'devices', 'query', 'netconn', 'rows', 'command', 'output')) and (temp[key] != None):
+        if (key not in ('verbose', 'devices', 'query', 'netconn', 'rows', 'command', 'output', 'start', 'end', 'window')) and (temp[key] != None):
             query_filter_dict[key] = temp[key]
     
     # Table template configurations
-    if (args.command == "query_enriched_events") and args.enriched_event_type :
+    if (args.command == "investigate") and args.enriched_event_type :
         template_name = args.enriched_event_type.upper()
         export_template = TABLE_TEMPLATE[template_name]
         l.info(f'Chose the {template_name} template for the output file')
@@ -400,26 +488,33 @@ def main():
  \___|_  /|______/\____|__  /____|    \n\
        \/        @HurdDFIR\/          \n\
 ######################################{bcolors.ENDC}')
-    # LOGGING CONFIGURATION
-    
     # ARGUMENT PARSER
     args, query_filter_dict, export_template = argument_parser(author='Stephen Hurd', version=0.3, date='04/03/2023')
 
+    #LOGGING CONFIG
+
+    # API connect
     api = api_connect('default')
 
-    # Main argument parsing logic
+    # MAIN LOGIC
     if(args.devices):
-        download_devices(api)
+        download_devices(api=api,output_file=args.output)
 
-    if(args.command == 'query_enriched_events'):
+    if(args.command == 'investigate'):
         try:
             rows_limit = args.rows
         except:
             rows_limit = 10000
-        l.info(f'Query filters to be applied: {query_filter_dict}')
-        query = build_query(api=api,query_type='enriched_event',rows=rows_limit,kwargs=query_filter_dict)
+        query = build_query(
+            api=api,query_type='enriched_event',
+            rows=rows_limit,
+            start=args.start,
+            end=args.end,
+            window=args.window,
+            kwargs=query_filter_dict
+        )
         results = query.make_query()
-        get_enriched_events(results,export_template=export_template,output_file=args.output)
+        get_enriched_events(results,export_template=export_template,output_file=args.output, verbose=args.verbose)
         
     if(args.command == 'query_processes'):
         l.error('This functionality has not been implemented yet. Please be patient while I work hard to get this function implemented properly.')
