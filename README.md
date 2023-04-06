@@ -1,5 +1,5 @@
 # cb-hunt
-cb-hunt is a python project to integrate with the Carbon Black API to perform threat hunts at scale. 
+cb-hunt is a python project to integrate with the Carbon Black API to perform threat hunts at scale. Yes, this readme is a mess. Yes, I'll fix it some day when I'm bored. 
 
 usage: python3.exe hunt.py [-h] [-v] [-d] [-o OUTPUT] {investigate} ...
 
